@@ -24,6 +24,12 @@ use std::{
 };
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt::format::FmtSpan;
+use turso_sync_engine::object_store::ObjectStoreReplicaState;
+#[cfg(not(target_arch = "wasm32"))]
+use turso_sync_engine::object_store::{
+    ObjectStoreMetadataEncryption, S3ObjectStoreRemote, S3ObjectStoreRemoteConfig,
+    S3StaticCredentials,
+};
 
 /// Step result constants
 const STEP_ROW: u32 = 1;
@@ -53,6 +59,7 @@ pub struct DatabaseInner {
     io: Arc<dyn turso_core::IO>,
     connect: OnceLock<DatabaseConnect>,
     default_safe_integers: Mutex<bool>,
+    s3_page_sync: Mutex<Option<ObjectStoreReplicaState>>,
 }
 
 pub struct DatabaseConnect {
@@ -151,6 +158,26 @@ pub struct EncryptionOpts {
     pub hexkey: String,
 }
 
+#[napi(object)]
+#[derive(Clone)]
+pub struct S3PageSyncCredentialsOpts {
+    pub access_key_id: String,
+    pub secret_access_key: String,
+    pub session_token: Option<String>,
+}
+
+#[napi(object)]
+#[derive(Clone)]
+pub struct S3PageSyncNativeOpts {
+    pub endpoint: String,
+    pub bucket: String,
+    pub prefix: String,
+    pub region: Option<String>,
+    pub client_name: Option<String>,
+    pub metadata_encryption_hexkey: String,
+    pub credentials: S3PageSyncCredentialsOpts,
+}
+
 /// Most of the options are aligned with better-sqlite API
 /// (see https://github.com/WiseLibs/better-sqlite3/blob/master/docs/api.md#new-databasepath-options)
 #[napi(object)]
@@ -194,6 +221,46 @@ fn create_generic_error(message: &str) -> napi::Error {
 
 fn create_error(status: napi::Status, message: &str) -> napi::Error {
     Error::new(status, message)
+}
+
+fn s3_page_metadata_crypto(
+    cipher: EncryptionCipher,
+    hexkey: &str,
+) -> napi::Result<turso_core::EncryptionContext> {
+    let key = turso_core::EncryptionKey::from_hex_string(hexkey)
+        .map_err(|e| to_generic_error("invalid encryption key", e))?;
+    let cipher_mode = turso_core::CipherMode::try_from(cipher.as_str())
+        .map_err(|e| to_generic_error("invalid encryption cipher", e))?;
+    turso_core::EncryptionContext::new(cipher_mode, &key, 0)
+        .map_err(|e| to_generic_error("failed to initialize metadata encryption", e))
+}
+
+#[napi(js_name = "encryptS3PageMetadata")]
+pub fn encrypt_s3_page_metadata(
+    plaintext: Buffer,
+    cipher: EncryptionCipher,
+    hexkey: String,
+    aad: String,
+) -> napi::Result<Buffer> {
+    let ctx = s3_page_metadata_crypto(cipher, &hexkey)?;
+    let encrypted = ctx
+        .encrypt_metadata_blob(plaintext.as_ref(), aad.as_bytes())
+        .map_err(|e| to_generic_error("failed to encrypt S3 page metadata", e))?;
+    Ok(Buffer::from(encrypted))
+}
+
+#[napi(js_name = "decryptS3PageMetadata")]
+pub fn decrypt_s3_page_metadata(
+    encrypted: Buffer,
+    cipher: EncryptionCipher,
+    hexkey: String,
+    aad: String,
+) -> napi::Result<Buffer> {
+    let ctx = s3_page_metadata_crypto(cipher, &hexkey)?;
+    let plaintext = ctx
+        .decrypt_metadata_blob(encrypted.as_ref(), aad.as_bytes())
+        .map_err(|e| to_generic_error("failed to decrypt S3 page metadata", e))?;
+    Ok(Buffer::from(plaintext))
 }
 
 fn connect_sync(db: &DatabaseInner) -> napi::Result<()> {
@@ -324,6 +391,7 @@ impl Database {
                 io,
                 connect: OnceLock::new(),
                 default_safe_integers: Mutex::new(false),
+                s3_page_sync: Mutex::new(None),
             })),
         })
     }
@@ -366,6 +434,15 @@ impl Database {
             return Err(create_generic_error("database must be connected"));
         };
         Ok(conn.clone())
+    }
+
+    fn core_db(&self) -> napi::Result<Arc<turso_core::Database>> {
+        let Some(DatabaseConnect { _db: Some(db), .. }) = self.inner()?.connect.get() else {
+            return Err(create_generic_error(
+                "database must be connected through a local Database instance",
+            ));
+        };
+        Ok(db.clone())
     }
 
     /// Returns whether the database is in readonly-only mode.
@@ -525,6 +602,85 @@ impl Database {
             Ok(None) => Ok("read".to_string()),
             Err(e) => Err(napi::Error::from_reason(format!("classify failed: {e}"))),
         }
+    }
+
+    #[napi(js_name = "enableS3PageSync")]
+    pub fn enable_s3_page_sync(&self, opts: S3PageSyncNativeOpts) -> napi::Result<()> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = opts;
+            return Err(create_generic_error(
+                "enableS3PageSync is not available in the wasm build",
+            ));
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+        let db = self.core_db()?;
+        let conn = self.conn()?;
+        conn.execute("PRAGMA journal_mode = 'mvcc'")
+            .map_err(|e| to_generic_error("failed to enable mvcc journal mode", e))?;
+
+        let remote = S3ObjectStoreRemote::new(S3ObjectStoreRemoteConfig {
+            endpoint: opts.endpoint,
+            bucket: opts.bucket,
+            prefix: opts.prefix,
+            region: opts.region.unwrap_or_else(|| "us-east-1".to_string()),
+            credentials: S3StaticCredentials {
+                access_key_id: opts.credentials.access_key_id,
+                secret_access_key: opts.credentials.secret_access_key,
+                session_token: opts.credentials.session_token,
+            },
+        })
+        .map_err(|e| create_generic_error(&format!("failed to configure S3 page sync: {e}")))?;
+        let database_id = remote.database_id();
+        let client_name = opts
+            .client_name
+            .unwrap_or_else(|| "turso-sync-js".to_string());
+        let random_suffix = format!("{:016x}", self.inner()?.io.generate_random_number() as u64);
+        let client_id = format!("{client_name}-{random_suffix}");
+        let state = ObjectStoreReplicaState::open(
+            self.inner()?.io.clone(),
+            &self.inner()?.path,
+            &database_id,
+            &client_id,
+        )
+        .map_err(|e| to_generic_error("failed to open S3 page sidecar", e))?;
+        if state.metadata().database_id != database_id {
+            return Err(create_generic_error(
+                "existing S3 page sidecar points at a different remote database",
+            ));
+        }
+        state
+            .install_remote(
+                &db,
+                remote,
+                Some(
+                    ObjectStoreMetadataEncryption::aegis256(&opts.metadata_encryption_hexkey)
+                        .map_err(|e| {
+                            to_generic_error(
+                                "failed to configure S3 page metadata encryption",
+                                e,
+                            )
+                        })?,
+                ),
+            )
+            .map_err(|e| to_generic_error("failed to install S3 page sync", e))?;
+        *self.inner()?.s3_page_sync.lock().unwrap() = Some(state);
+        Ok(())
+        }
+    }
+
+    #[napi(js_name = "captureS3PageSyncState")]
+    pub fn capture_s3_page_sync_state(&self) -> napi::Result<bool> {
+        let db = self.core_db()?;
+        let mut guard = self.inner()?.s3_page_sync.lock().unwrap();
+        let Some(state) = guard.as_mut() else {
+            return Ok(false);
+        };
+        state
+            .capture_and_persist(&db)
+            .map_err(|e| to_generic_error("failed to persist S3 page sync state", e))
     }
 }
 

@@ -1,4 +1,5 @@
 pub mod busy;
+pub mod commit_coordinator;
 #[cfg(feature = "cli_only")]
 pub mod dbpage;
 #[cfg(any(feature = "fuzz", feature = "bench"))]
@@ -61,6 +62,7 @@ pub use function::MathFunc;
 
 use crate::{
     busy::{BusyHandler, BusyHandlerCallback},
+    commit_coordinator::{ExternalCommitCoordinator, ExternalCommitState},
     incremental::view::AllViewsTxState,
     index_method::IndexMethod,
     schema::Trigger,
@@ -1543,6 +1545,36 @@ impl Database {
 
     pub fn get_mv_store(&self) -> impl Deref<Target = Option<Arc<MvStore>>> {
         self.mv_store.load()
+    }
+
+    pub fn install_external_commit_coordinator(
+        &self,
+        coordinator: Arc<dyn ExternalCommitCoordinator>,
+        state: ExternalCommitState,
+    ) -> Result<()> {
+        let mv_store =
+            self.get_mv_store().as_ref().cloned().ok_or_else(|| {
+                LimboError::InvalidArgument("MVCC mode is not enabled".to_string())
+            })?;
+        mv_store.install_external_commit_coordinator(coordinator, state);
+        Ok(())
+    }
+
+    pub fn clear_external_commit_coordinator(&self) -> Result<()> {
+        let mv_store =
+            self.get_mv_store().as_ref().cloned().ok_or_else(|| {
+                LimboError::InvalidArgument("MVCC mode is not enabled".to_string())
+            })?;
+        mv_store.clear_external_commit_coordinator();
+        Ok(())
+    }
+
+    pub fn external_commit_state(&self) -> Result<Option<ExternalCommitState>> {
+        let mv_store =
+            self.get_mv_store().as_ref().cloned().ok_or_else(|| {
+                LimboError::InvalidArgument("MVCC mode is not enabled".to_string())
+            })?;
+        Ok(mv_store.external_commit_state())
     }
 
     pub fn experimental_views_enabled(&self) -> bool {

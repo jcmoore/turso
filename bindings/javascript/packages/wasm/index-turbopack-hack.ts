@@ -1,3 +1,4 @@
+import "./ensure-buffer.js";
 import { setupMainThread } from "@tursodatabase/database-wasm-common";
 import { tursoWasm } from "./wasm-inline.js";
 

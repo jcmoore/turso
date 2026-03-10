@@ -91,6 +91,8 @@ export declare class Database {
   ioLoopAsync(): Promise<void>
   /** Classify SQL statement. Returns "read", "write", "begin", "commit", or "rollback". */
   classifySql(sql: string): string
+  enableS3PageSync(opts: S3PageSyncNativeOpts): void
+  captureS3PageSyncState(): boolean
 }
 
 /** A prepared statement. */
@@ -156,6 +158,8 @@ export interface DatabaseOpts {
   encryption?: EncryptionOpts
 }
 
+export declare function decryptS3PageMetadata(encrypted: Buffer, cipher: EncryptionCipher, hexkey: string, aad: string): Buffer
+
 /** Supported encryption ciphers for local database encryption. */
 export declare const enum EncryptionCipher {
   Aes128Gcm = 0,
@@ -173,6 +177,24 @@ export interface EncryptionOpts {
   cipher: EncryptionCipher
   /** The hex-encoded encryption key */
   hexkey: string
+}
+
+export declare function encryptS3PageMetadata(plaintext: Buffer, cipher: EncryptionCipher, hexkey: string, aad: string): Buffer
+
+export interface S3PageSyncCredentialsOpts {
+  accessKeyId: string
+  secretAccessKey: string
+  sessionToken?: string
+}
+
+export interface S3PageSyncNativeOpts {
+  endpoint: string
+  bucket: string
+  prefix: string
+  region?: string
+  clientName?: string
+  metadataEncryptionHexkey: string
+  credentials: S3PageSyncCredentialsOpts
 }
 export declare class GeneratorHolder {
   resumeSync(error?: string | undefined | null): GeneratorResponse

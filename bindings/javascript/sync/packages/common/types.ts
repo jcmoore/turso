@@ -66,6 +66,29 @@ export interface EncryptionOpts {
     // - aegis256, aegis256x2, aegis256x4: 48 reserved bytes
     cipher: 'aes256gcm' | 'aes128gcm' | 'chacha20poly1305' | 'aegis128l' | 'aegis128x2' | 'aegis128x4' | 'aegis256' | 'aegis256x2' | 'aegis256x4'
 }
+
+export interface S3PageSyncCredentials {
+    accessKeyId: string
+    secretAccessKey: string
+    sessionToken?: string
+}
+
+export interface S3PageRemoteEncryptionOpts {
+    key: string
+    cipher: 'aegis256'
+}
+
+export interface S3PageSyncOpts {
+    backend: 's3_page_v1'
+    endpoint: string
+    bucket: string
+    prefix: string
+    region?: string
+    credentials: () => Promise<S3PageSyncCredentials>
+    remoteEncryption: S3PageRemoteEncryptionOpts
+    staleReads?: true
+}
+
 export interface DatabaseOpts {
     /**
      * local path where to store all synced database files (e.g. local.db)
@@ -134,6 +157,11 @@ export interface DatabaseOpts {
         /* optional parameter which makes sync engine to prefetch pages which probably will be accessed soon */
         prefetch?: boolean,
     }
+    /**
+     * explicit sync backend configuration.
+     * if omitted, the legacy Turso Cloud sync path is used.
+     */
+    sync?: S3PageSyncOpts
 }
 export interface DatabaseStats {
     /**

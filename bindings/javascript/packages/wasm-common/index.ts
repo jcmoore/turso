@@ -1,3 +1,4 @@
+import "./ensure-buffer.js";
 import {
     createOnMessage as __wasmCreateOnMessageForFsProxy,
     getDefaultContext as __emnapiGetDefaultContext,

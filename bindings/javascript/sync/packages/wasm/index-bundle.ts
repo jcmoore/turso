@@ -1,3 +1,4 @@
+import "./ensure-buffer.js";
 import { setupMainThread } from "@tursodatabase/database-wasm-common";
 //@ts-ignore
 import TursoWorker from "./worker.js?worker&inline";
@@ -30,4 +31,6 @@ export const JsProtocolRequestBytes = napiModule.exports.JsProtocolRequestBytes
 export const SyncEngine = napiModule.exports.SyncEngine
 export const DatabaseChangeTypeJs = napiModule.exports.DatabaseChangeTypeJs
 export const SyncEngineProtocolVersion = napiModule.exports.SyncEngineProtocolVersion
-
+export const EncryptionCipher = napiModule.exports.EncryptionCipher
+export const encryptS3PageMetadata = napiModule.exports.encryptS3PageMetadata
+export const decryptS3PageMetadata = napiModule.exports.decryptS3PageMetadata

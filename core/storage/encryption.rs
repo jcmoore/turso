@@ -72,6 +72,8 @@ const TURSO_VERSION: u8 = 0x00;
 const VERSION_OFFSET: usize = 5;
 const CIPHER_OFFSET: usize = 6;
 const TURSO_HEADER_SIZE: usize = 16;
+const METADATA_BLOB_MAGIC: &[u8; 4] = b"TS3M";
+const METADATA_BLOB_VERSION: u8 = 1;
 
 #[derive(Clone)]
 pub enum EncryptionKey {
@@ -681,6 +683,55 @@ impl EncryptionContext {
             self.page_size
         );
         Ok(result)
+    }
+
+    #[cfg(feature = "encryption")]
+    pub fn encrypt_metadata_blob(&self, plaintext: &[u8], ad: &[u8]) -> Result<Vec<u8>> {
+        let (ciphertext, nonce) = self.encrypt_raw_with_ad(plaintext, ad)?;
+        let mut result = Vec::with_capacity(6 + ciphertext.len() + nonce.len());
+        result.extend_from_slice(METADATA_BLOB_MAGIC);
+        result.push(METADATA_BLOB_VERSION);
+        result.push(self.cipher_mode.cipher_id());
+        result.extend_from_slice(&ciphertext);
+        result.extend_from_slice(&nonce);
+        Ok(result)
+    }
+
+    #[cfg(feature = "encryption")]
+    pub fn decrypt_metadata_blob(&self, encrypted_blob: &[u8], ad: &[u8]) -> Result<Vec<u8>> {
+        if encrypted_blob.len() < 6 {
+            return Err(LimboError::InternalError(
+                "encrypted metadata blob is too short".into(),
+            ));
+        }
+        if &encrypted_blob[..4] != METADATA_BLOB_MAGIC {
+            return Err(LimboError::InternalError(
+                "invalid encrypted metadata blob magic".into(),
+            ));
+        }
+        if encrypted_blob[4] != METADATA_BLOB_VERSION {
+            return Err(LimboError::InternalError(format!(
+                "unsupported encrypted metadata blob version: {}",
+                encrypted_blob[4]
+            )));
+        }
+        let cipher_mode = CipherMode::from_cipher_id(encrypted_blob[5])?;
+        if cipher_mode != self.cipher_mode {
+            return Err(LimboError::InternalError(format!(
+                "metadata blob cipher mismatch: expected {:?}, got {:?}",
+                self.cipher_mode, cipher_mode
+            )));
+        }
+        let nonce_size = self.cipher_mode.nonce_size();
+        if encrypted_blob.len() < 6 + nonce_size {
+            return Err(LimboError::InternalError(
+                "encrypted metadata blob is missing nonce bytes".into(),
+            ));
+        }
+        let nonce_offset = encrypted_blob.len() - nonce_size;
+        let ciphertext = &encrypted_blob[6..nonce_offset];
+        let nonce = &encrypted_blob[nonce_offset..];
+        self.decrypt_raw_with_ad(ciphertext, nonce, ad)
     }
 
     #[cfg(feature = "encryption")]

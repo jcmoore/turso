@@ -1,6 +1,10 @@
 use rustc_hash::FxHashSet as HashSet;
 
 use super::*;
+use crate::commit_coordinator::{
+    ExternalCommitCoordinator, ExternalCommitOutcome, ExternalCommitRequest, ExternalCommitState,
+    RemoteHeadMetadata,
+};
 use crate::io::PlatformIO;
 use crate::mvcc::clock::MvccClock;
 use crate::mvcc::cursor::MvccCursorType;
@@ -2627,6 +2631,160 @@ pub(crate) fn commit_tx_no_conn(
     }
     assert!(sm.is_finalized());
     Ok(())
+}
+
+struct RecordingExternalCommitCoordinator {
+    requests: Mutex<Vec<ExternalCommitRequest>>,
+    outcome: ExternalCommitOutcome,
+}
+
+impl RecordingExternalCommitCoordinator {
+    fn published(new_head: RemoteHeadMetadata) -> Self {
+        Self {
+            requests: Mutex::new(Vec::new()),
+            outcome: ExternalCommitOutcome::Published { new_head },
+        }
+    }
+
+    fn conflict() -> Self {
+        Self {
+            requests: Mutex::new(Vec::new()),
+            outcome: ExternalCommitOutcome::Conflict,
+        }
+    }
+}
+
+impl ExternalCommitCoordinator for RecordingExternalCommitCoordinator {
+    fn precommit(&self, request: &ExternalCommitRequest) -> Result<ExternalCommitOutcome> {
+        self.requests.lock().push(request.clone());
+        Ok(self.outcome.clone())
+    }
+}
+
+#[test]
+fn test_external_commit_coordinator_observes_header_page_and_updates_head() {
+    let db = MvccTestDb::new();
+    let published_head =
+        RemoteHeadMetadata::new(Some("commit-1".to_string()), 8, Some("etag-1".to_string()));
+    let coordinator = Arc::new(RecordingExternalCommitCoordinator::published(
+        published_head.clone(),
+    ));
+    db.mvcc_store.install_external_commit_coordinator(
+        coordinator.clone(),
+        ExternalCommitState {
+            database_id: "db-1".to_string(),
+            client_id: "client-1".to_string(),
+            remote_head: RemoteHeadMetadata::new(
+                Some("commit-0".to_string()),
+                7,
+                Some("etag-0".to_string()),
+            ),
+            selector_id: Some("tenant/main".to_string()),
+            selector_hash: Some("hash-1".to_string()),
+            selector_version: Some("v1".to_string()),
+        },
+    );
+
+    let tx_id = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.load().clone())
+        .unwrap();
+    db.mvcc_store
+        .with_header_mut(
+            |header| {
+                header.user_version = 42.into();
+            },
+            Some(&tx_id),
+        )
+        .unwrap();
+
+    commit_tx(db.mvcc_store.clone(), &db.conn, tx_id).unwrap();
+
+    let requests = coordinator.requests.lock();
+    assert_eq!(requests.len(), 1);
+    let request = &requests[0];
+    assert_eq!(request.database_id, "db-1");
+    assert_eq!(request.client_id, "client-1");
+    assert_eq!(
+        request.base_head,
+        RemoteHeadMetadata::new(Some("commit-0".to_string()), 7, Some("etag-0".to_string()))
+    );
+    assert_eq!(request.selector_id.as_deref(), Some("tenant/main"));
+    assert_eq!(request.selector_hash.as_deref(), Some("hash-1"));
+    assert_eq!(request.selector_version.as_deref(), Some("v1"));
+    assert_eq!(request.changed_page_ids, vec![1]);
+
+    let page_1 = request
+        .page_images
+        .iter()
+        .find(|page| page.page_id == DatabaseHeader::PAGE_ID as u32)
+        .expect("page 1 image should be present");
+    let header = bytemuck::from_bytes::<DatabaseHeader>(&page_1.bytes[0..DatabaseHeader::SIZE]);
+    assert_eq!(request.page_count, header.database_size.get());
+    assert_eq!(header.user_version.get(), 42);
+
+    assert_eq!(
+        db.mvcc_store.external_commit_state().unwrap().remote_head,
+        published_head
+    );
+}
+
+#[test]
+fn test_external_commit_conflict_maps_to_busy_snapshot_before_local_commit() {
+    let db = MvccTestDb::new();
+    let coordinator = Arc::new(RecordingExternalCommitCoordinator::conflict());
+    let initial_head =
+        RemoteHeadMetadata::new(Some("commit-0".to_string()), 7, Some("etag-0".to_string()));
+    db.mvcc_store.install_external_commit_coordinator(
+        coordinator.clone(),
+        ExternalCommitState {
+            database_id: "db-1".to_string(),
+            client_id: "client-1".to_string(),
+            remote_head: initial_head.clone(),
+            selector_id: None,
+            selector_hash: None,
+            selector_version: None,
+        },
+    );
+
+    let tx_id = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.load().clone())
+        .unwrap();
+    db.mvcc_store
+        .with_header_mut(
+            |header| {
+                header.user_version = 99.into();
+            },
+            Some(&tx_id),
+        )
+        .unwrap();
+
+    let err = commit_tx(db.mvcc_store.clone(), &db.conn, tx_id).unwrap_err();
+    assert!(matches!(err, LimboError::BusySnapshot));
+    assert!(db.mvcc_store.is_tx_rollbackable(tx_id));
+    assert_eq!(
+        db.mvcc_store.external_commit_state().unwrap().remote_head,
+        initial_head
+    );
+
+    db.mvcc_store.rollback_tx(
+        tx_id,
+        db.conn.pager.load().clone(),
+        &db.conn,
+        crate::MAIN_DB_ID,
+    );
+    assert!(!db.mvcc_store.is_tx_rollbackable(tx_id));
+    assert_eq!(
+        db.mvcc_store
+            .with_header(|header| header.user_version.get(), None)
+            .unwrap(),
+        0
+    );
+
+    let requests = coordinator.requests.lock();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].changed_page_ids, vec![1]);
 }
 
 /// What this test checks: Cursor traversal and seek operations honor MVCC visibility and key ordering under updates/deletes.

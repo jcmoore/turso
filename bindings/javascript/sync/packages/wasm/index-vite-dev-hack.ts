@@ -1,3 +1,4 @@
+import "./ensure-buffer.js";
 import { isWebWorker, setupMainThread, setupWebWorker } from "@tursodatabase/database-wasm-common";
 import { tursoWasm } from "./wasm-inline.js";
 
@@ -16,6 +17,9 @@ let napiModule = {
     SyncEngine: {} as any,
     DatabaseChangeTypeJs: {} as any,
     SyncEngineProtocolVersion: {} as any,
+    EncryptionCipher: {} as any,
+    encryptS3PageMetadata: {} as any,
+    decryptS3PageMetadata: {} as any,
   }
 };
 
@@ -53,4 +57,6 @@ export const JsProtocolRequestBytes = napiModule.exports.JsProtocolRequestBytes
 export const SyncEngine = napiModule.exports.SyncEngine
 export const DatabaseChangeTypeJs = napiModule.exports.DatabaseChangeTypeJs
 export const SyncEngineProtocolVersion = napiModule.exports.SyncEngineProtocolVersion
-
+export const EncryptionCipher = napiModule.exports.EncryptionCipher
+export const encryptS3PageMetadata = napiModule.exports.encryptS3PageMetadata
+export const decryptS3PageMetadata = napiModule.exports.decryptS3PageMetadata

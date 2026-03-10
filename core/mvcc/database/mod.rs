@@ -14,7 +14,6 @@ use crate::storage::sqlite3_ondisk::DatabaseHeader;
 use crate::storage::wal::{CheckpointMode, CheckpointResult, TursoRwLock};
 use crate::sync::atomic::{AtomicBool, AtomicI64};
 use crate::sync::atomic::{AtomicU64, Ordering};
-use crate::sync::Arc;
 use crate::sync::{Mutex, RwLock};
 use crate::translate::plan::IterationDirection;
 use crate::types::compare_immutable;
@@ -29,10 +28,18 @@ use crate::LimboError;
 use crate::Result;
 use crate::ValueRef;
 use crate::{
+    commit_coordinator::{
+        CommitPageImage, ExternalCommitCoordinator, ExternalCommitOutcome, ExternalCommitRequest,
+        ExternalCommitState, RemoteHeadMetadata,
+    },
+    sync::Arc,
+};
+use crate::{
     contains_ignore_ascii_case, eq_ignore_ascii_case, match_ignore_ascii_case, Completion,
 };
 use crate::{
-    turso_assert, turso_assert_eq, turso_assert_less_than, turso_assert_reachable, Numeric,
+    turso_assert, turso_assert_eq, turso_assert_greater_than_or_equal, turso_assert_less_than,
+    turso_assert_reachable, Numeric,
 };
 use crate::{Connection, Pager, SyncMode};
 use crossbeam_skiplist::map::Entry;
@@ -879,15 +886,69 @@ pub enum WriteRowState {
     Next,
 }
 
-#[derive(Debug)]
+#[derive(Clone)]
+struct InstalledExternalCommitCoordinator {
+    coordinator: Arc<dyn ExternalCommitCoordinator>,
+    state: ExternalCommitState,
+}
+
 struct CommitCoordinator {
     pager_commit_lock: Arc<TursoRwLock>,
+    external_commit: RwLock<Option<InstalledExternalCommitCoordinator>>,
+}
+
+impl Debug for CommitCoordinator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CommitCoordinator")
+            .field(
+                "external_commit",
+                &self.external_commit.read().as_ref().map(|registration| {
+                    (
+                        registration.state.database_id.as_str(),
+                        registration.state.client_id.as_str(),
+                        registration.state.remote_head.sequence_no,
+                    )
+                }),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 impl CommitCoordinator {
     fn new() -> Self {
         Self {
             pager_commit_lock: Arc::new(TursoRwLock::new()),
+            external_commit: RwLock::new(None),
+        }
+    }
+
+    fn install_external(
+        &self,
+        coordinator: Arc<dyn ExternalCommitCoordinator>,
+        state: ExternalCommitState,
+    ) {
+        *self.external_commit.write() =
+            Some(InstalledExternalCommitCoordinator { coordinator, state });
+    }
+
+    fn clear_external(&self) {
+        self.external_commit.write().take();
+    }
+
+    fn external(&self) -> Option<InstalledExternalCommitCoordinator> {
+        self.external_commit.read().clone()
+    }
+
+    fn external_state(&self) -> Option<ExternalCommitState> {
+        self.external_commit
+            .read()
+            .as_ref()
+            .map(|registration| registration.state.clone())
+    }
+
+    fn update_external_head(&self, new_head: RemoteHeadMetadata) {
+        if let Some(registration) = self.external_commit.write().as_mut() {
+            registration.state.remote_head = new_head;
         }
     }
 }
@@ -1180,6 +1241,74 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         }
         Ok(())
     }
+
+    fn run_external_precommit(&self, tx: &Transaction) -> Result<()> {
+        let Some(registration) = self.commit_coordinator.external() else {
+            return Ok(());
+        };
+
+        let mut page_images = self.pager.snapshot_dirty_page_images()?;
+        self.overlay_transaction_header_page(tx, &mut page_images)?;
+        let changed_page_ids = page_images.iter().map(|page| page.page_id).collect();
+        let page_count = tx.header.read().database_size.get();
+        let request = ExternalCommitRequest {
+            database_id: registration.state.database_id.clone(),
+            client_id: registration.state.client_id.clone(),
+            transaction_id: self.tx_id.to_string(),
+            base_head: registration.state.remote_head.clone(),
+            page_count,
+            changed_page_ids,
+            page_images,
+            selector_id: registration.state.selector_id.clone(),
+            selector_hash: registration.state.selector_hash.clone(),
+            selector_version: registration.state.selector_version.clone(),
+        };
+
+        match registration.coordinator.precommit(&request)? {
+            ExternalCommitOutcome::Published { new_head } => {
+                self.commit_coordinator.update_external_head(new_head);
+                Ok(())
+            }
+            ExternalCommitOutcome::Conflict => Err(LimboError::BusySnapshot),
+        }
+    }
+
+    fn overlay_transaction_header_page(
+        &self,
+        tx: &Transaction,
+        page_images: &mut Vec<CommitPageImage>,
+    ) -> Result<()> {
+        if !tx.header_dirty.load(Ordering::Acquire) {
+            return Ok(());
+        }
+
+        let header = *tx.header.read();
+        let header_bytes = bytemuck::bytes_of(&header);
+        let page_1 = match page_images
+            .iter_mut()
+            .find(|page| page.page_id == DatabaseHeader::PAGE_ID as u32)
+        {
+            Some(page) => page,
+            None => {
+                page_images.push(
+                    self.pager
+                        .snapshot_page_image(DatabaseHeader::PAGE_ID as u32)?,
+                );
+                page_images
+                    .iter_mut()
+                    .find(|page| page.page_id == DatabaseHeader::PAGE_ID as u32)
+                    .expect("page 1 image was just inserted")
+            }
+        };
+        turso_assert_greater_than_or_equal!(
+            page_1.bytes.len(),
+            DatabaseHeader::SIZE,
+            "page 1 snapshot must contain the SQLite header"
+        );
+        page_1.bytes[0..DatabaseHeader::SIZE].copy_from_slice(header_bytes);
+        page_images.sort_by_key(|page| page.page_id);
+        Ok(())
+    }
 }
 
 impl WriteRowStateMachine {
@@ -1455,6 +1584,8 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     self.finalize(mvcc_store)?;
                     return Ok(TransitionResult::Done(()));
                 }
+
+                self.run_external_precommit(tx)?;
 
                 // All dependencies resolved — proceed with timestamp updates
                 // (Hekaton Section 3.3: Postprocessing).
@@ -3271,6 +3402,22 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 connection.get_sync_mode(),
             ));
         Ok(state_machine)
+    }
+
+    pub fn install_external_commit_coordinator(
+        &self,
+        coordinator: Arc<dyn ExternalCommitCoordinator>,
+        state: ExternalCommitState,
+    ) {
+        self.commit_coordinator.install_external(coordinator, state);
+    }
+
+    pub fn clear_external_commit_coordinator(&self) {
+        self.commit_coordinator.clear_external();
+    }
+
+    pub fn external_commit_state(&self) -> Option<ExternalCommitState> {
+        self.commit_coordinator.external_state()
     }
 
     /// Returns true if the transaction can be rolled back (Active or Preparing).

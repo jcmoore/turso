@@ -38,7 +38,7 @@
     "vitest": "^3.2.4"
   },
   "scripts": {
-    "napi-build": "napi build --features browser --profile release-official --platform --target wasm32-wasip1-threads --no-js --manifest-path ../../Cargo.toml --output-dir . && rm index.d.ts sync.wasi* wasi* browser.js",
+    "napi-build": "EMNAPI_LINK_DIR=$(node ../../../scripts/print-emnapi-link-dir.js) RUSTUP_TOOLCHAIN=stable napi build --features browser --profile release-official --platform --target wasm32-wasip1-threads --no-js --manifest-path ../../Cargo.toml --output-dir . && rm index.d.ts sync.wasi* wasi* browser.js",
     "tsc-build": "npm exec tsc && cp sync.wasm32-wasi.wasm ./dist/sync.wasm32-wasi.wasm && WASM_FILE=sync.wasm32-wasi.wasm JS_FILE=./dist/wasm-inline.js node ../../../scripts/inline-wasm-base64.js && npm run bundle",
     "bundle": "vite build",
     "build": "npm run napi-build && npm run tsc-build",
@@ -56,6 +56,7 @@
   "dependencies": {
     "@tursodatabase/database-common": "^0.5.0-pre.20",
     "@tursodatabase/database-wasm-common": "^0.5.0-pre.20",
-    "@tursodatabase/sync-common": "^0.5.0-pre.20"
+    "@tursodatabase/sync-common": "^0.5.0-pre.20",
+    "buffer": "^6.0.3"
   }
 }

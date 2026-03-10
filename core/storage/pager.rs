@@ -1,4 +1,5 @@
 use crate::assert::assert_send_sync;
+use crate::commit_coordinator::CommitPageImage;
 #[cfg(target_vendor = "apple")]
 use crate::io::AtomicFileSyncType;
 use crate::io::FileSyncType;
@@ -2020,6 +2021,32 @@ impl Pager {
     /// Get the maximum page count for this database
     pub fn get_max_page_count(&self) -> u32 {
         self.max_page_count.load(Ordering::SeqCst)
+    }
+
+    pub fn snapshot_page_image(&self, page_id: u32) -> Result<CommitPageImage> {
+        let page = if let Some(page) = self.cache_get(page_id as usize)? {
+            page
+        } else {
+            let (page, completion) = self.read_page_no_cache(page_id as i64, None, false)?;
+            if !completion.finished() {
+                self.io.wait_for_completion(completion)?;
+            } else if let Some(err) = completion.get_error() {
+                return Err(err.into());
+            }
+            page
+        };
+        Ok(CommitPageImage {
+            page_id,
+            bytes: page.get_contents().as_ptr().to_vec(),
+        })
+    }
+
+    pub fn snapshot_dirty_page_images(&self) -> Result<Vec<CommitPageImage>> {
+        let dirty_page_ids: Vec<u32> = self.dirty_pages.read().iter().collect();
+        dirty_page_ids
+            .into_iter()
+            .map(|page_id| self.snapshot_page_image(page_id))
+            .collect()
     }
 
     /// Set the maximum page count for this database

@@ -1,6 +1,9 @@
 import { expect, test, afterAll } from 'vitest'
 import { Database, connect, DatabaseRowMutation, DatabaseRowTransformResult } from './promise-default.js'
-import { MainWorker } from './index-default.js'
+import { registerFileAtWorker, unregisterFileAtWorker, ioNotifier } from '@tursodatabase/database-wasm-common'
+import { DatabasePromise } from '@tursodatabase/database-common'
+import { S3PageClient } from '@tursodatabase/sync-common'
+import { Database as NativeDatabase, EncryptionCipher, MainWorker, encryptS3PageMetadata, initThreadPool } from './index-default.js'
 
 afterAll(() => {
     MainWorker?.terminate();
@@ -8,12 +11,371 @@ afterAll(() => {
 
 const localeCompare = (a, b) => a.x.localeCompare(b.x);
 const intCompare = (a, b) => a.x - b.x;
+const ENCRYPTION_KEY = 'BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=';
+const S3_PAGE_SEGMENT_MAGIC = 'TS3P';
+
+function bytesToHex(bytes: Uint8Array): string {
+    return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+function decodeBase64(base64: string): Uint8Array {
+    const decoded = atob(base64);
+    const bytes = new Uint8Array(decoded.length);
+    for (let index = 0; index < decoded.length; index += 1) {
+        bytes[index] = decoded.charCodeAt(index);
+    }
+    return bytes;
+}
+
+const ENCRYPTION_HEXKEY = bytesToHex(decodeBase64(ENCRYPTION_KEY));
+
+function encodeSegment(pages: Uint8Array[]): Uint8Array {
+    const totalBytes = pages.reduce((size, page) => size + 8 + page.byteLength, 12);
+    const payload = new Uint8Array(totalBytes);
+    const view = new DataView(payload.buffer);
+    let offset = 0;
+    payload.set(new TextEncoder().encode(S3_PAGE_SEGMENT_MAGIC), offset);
+    offset += 4;
+    view.setUint32(offset, 1, false);
+    offset += 4;
+    view.setUint32(offset, pages.length, false);
+    offset += 4;
+    for (let index = 0; index < pages.length; index += 1) {
+        view.setUint32(offset, index + 1, false);
+        offset += 4;
+        view.setUint32(offset, pages[index].byteLength, false);
+        offset += 4;
+        payload.set(pages[index], offset);
+        offset += pages[index].byteLength;
+    }
+    return payload;
+}
+
+async function readOpfsFile(path: string): Promise<Uint8Array> {
+    const root = await navigator.storage.getDirectory();
+    const handle = await root.getFileHandle(path);
+    const file = await handle.getFile();
+    return new Uint8Array(await file.arrayBuffer());
+}
+
+async function deleteOpfsFile(path: string): Promise<void> {
+    try {
+        const root = await navigator.storage.getDirectory();
+        await root.removeEntry(path);
+    } catch (error) {
+        if ((error as DOMException).name !== 'NotFoundError') {
+            throw error;
+        }
+    }
+}
+
+function pageSizeFromDatabaseBytes(bytes: Uint8Array): number {
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const value = view.getUint16(16, false);
+    return value === 1 ? 65536 : value;
+}
+
+async function openEncryptedLocalDb(path: string): Promise<DatabasePromise> {
+    await initThreadPool();
+    if (MainWorker == null) {
+        throw new Error('panic: MainWorker is not initialized');
+    }
+    await Promise.all([
+        registerFileAtWorker(MainWorker, path),
+        registerFileAtWorker(MainWorker, `${path}-wal`),
+    ]);
+    const db = new DatabasePromise(
+        new NativeDatabase(path, {
+            encryption: {
+                cipher: EncryptionCipher.Aegis256,
+                hexkey: ENCRYPTION_HEXKEY,
+            },
+        }) as any,
+        () => ioNotifier.waitForCompletion(),
+    );
+    await db.connect();
+    return db;
+}
+
+async function closeEncryptedLocalDb(path: string, db: DatabasePromise): Promise<void> {
+    await db.close();
+    if (MainWorker != null) {
+        await Promise.all([
+            unregisterFileAtWorker(MainWorker, path),
+            unregisterFileAtWorker(MainWorker, `${path}-wal`),
+        ]);
+    }
+}
+
+async function snapshotDatabasePages(path: string): Promise<Uint8Array[]> {
+    const bytes = await readOpfsFile(path);
+    const pageSize = pageSizeFromDatabaseBytes(bytes);
+    const pages: Uint8Array[] = [];
+    for (let offset = 0; offset < bytes.byteLength; offset += pageSize) {
+        pages.push(bytes.slice(offset, offset + pageSize));
+    }
+    return pages;
+}
+
+async function createSeedSnapshot(path: string, values: number[]): Promise<Uint8Array[]> {
+    const db = await openEncryptedLocalDb(path);
+    try {
+        await db.exec("PRAGMA journal_mode = 'mvcc'");
+        await db.exec('DROP TABLE IF EXISTS rows');
+        await db.exec('CREATE TABLE rows(value INTEGER PRIMARY KEY)');
+        if (values.length > 0) {
+            await db.exec(`INSERT INTO rows VALUES ${values.map((value) => `(${value})`).join(', ')}`);
+        }
+        await db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+    } finally {
+        await closeEncryptedLocalDb(path, db);
+    }
+    return await snapshotDatabasePages(path);
+}
+
+async function publishRemoteSnapshot(opts: {
+    client: S3PageClient;
+    endpoint: string;
+    bucket: string;
+    prefix: string;
+    commitId: string;
+    parentCommitId: string | null;
+    sequenceNo: number;
+    pages: Uint8Array[];
+    headEtag: string | null;
+}): Promise<string> {
+    const databaseId = `s3_page_v1:${new URL(opts.endpoint).toString()}/${opts.bucket}/${opts.prefix}`;
+    const segmentId = `${opts.commitId}-segment-0`;
+    await opts.client.putSegment(segmentId, encodeSegment(opts.pages));
+    await opts.client.putCommit(
+        opts.commitId,
+        encryptS3PageMetadata(
+            new TextEncoder().encode(
+                JSON.stringify({
+                    version: 1,
+                    database_id: databaseId,
+                    commit_id: opts.commitId,
+                    parent_commit_id: opts.parentCommitId,
+                    sequence_no: opts.sequenceNo,
+                    page_count: opts.pages.length,
+                    client_id: 'seed',
+                    transaction_id: opts.commitId,
+                    segments: [
+                        {
+                            segment_id: segmentId,
+                            page_ids: opts.pages.map((_, index) => index + 1),
+                        },
+                    ],
+                    selector: {},
+                }),
+            ),
+            EncryptionCipher.Aegis256,
+            ENCRYPTION_HEXKEY,
+            `commits/${opts.commitId}`,
+        ),
+    );
+    const headBytes = encryptS3PageMetadata(
+        new TextEncoder().encode(
+            JSON.stringify({
+                version: 1,
+                database_id: databaseId,
+                head_commit_id: opts.commitId,
+                sequence_no: opts.sequenceNo,
+            }),
+        ),
+        EncryptionCipher.Aegis256,
+        ENCRYPTION_HEXKEY,
+        'refs/head',
+    );
+    if (opts.headEtag == null) {
+        const created = await opts.client.putObjectIfAbsent('refs/head', headBytes);
+        return created.etag!;
+    }
+    const updated = await opts.client.casHead(headBytes, opts.headEtag);
+    return updated.etag!;
+}
+
+function createMockS3Fetch() {
+    const buckets = new Set<string>();
+    const objects = new Map<string, { body: Uint8Array; etag: string; contentType: string | null }>();
+    let etagCounter = 0;
+
+    const nextEtag = () => `etag-${++etagCounter}`;
+    const objectKeyFor = (url: URL) => url.pathname.replace(/^\/+/, '');
+
+    const fetchImpl: typeof fetch = async (input, init) => {
+        const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+        const method = (init?.method ?? 'GET').toUpperCase();
+        const pathname = url.pathname.replace(/^\/+/, '');
+        const headers = new Headers(init?.headers ?? {});
+        const pathParts = pathname.split('/').filter(Boolean);
+
+        if (method === 'PUT' && pathParts.length === 1) {
+            const bucket = pathParts[0];
+            if (buckets.has(bucket)) {
+                return new Response(null, { status: 409 });
+            }
+            buckets.add(bucket);
+            return new Response(null, { status: 200 });
+        }
+
+        const key = objectKeyFor(url);
+        const current = objects.get(key);
+        if (method === 'HEAD') {
+            if (current == null) {
+                return new Response(null, { status: 404 });
+            }
+            return new Response(null, {
+                status: 200,
+                headers: current.etag == null ? undefined : { etag: `"${current.etag}"` },
+            });
+        }
+        if (method === 'GET') {
+            if (current == null) {
+                return new Response(null, { status: 404 });
+            }
+            const bodyCopy = current.body.slice();
+            return new Response(bodyCopy.buffer as ArrayBuffer, {
+                status: 200,
+                headers: {
+                    etag: `"${current.etag}"`,
+                    ...(current.contentType == null ? {} : { 'content-type': current.contentType }),
+                },
+            });
+        }
+        if (method === 'PUT') {
+            const ifNoneMatch = headers.get('if-none-match');
+            const ifMatch = headers.get('if-match')?.replace(/^"|"$/g, '') ?? null;
+            if (ifNoneMatch === '*' && current != null) {
+                return new Response(null, { status: 412 });
+            }
+            if (ifMatch != null && current?.etag !== ifMatch) {
+                return new Response(null, { status: 412 });
+            }
+            const body = init?.body == null ? new Uint8Array() : new Uint8Array(await new Response(init.body).arrayBuffer());
+            const etag = nextEtag();
+            objects.set(key, {
+                body,
+                etag,
+                contentType: headers.get('content-type'),
+            });
+            return new Response(null, {
+                status: 200,
+                headers: { etag: `"${etag}"` },
+            });
+        }
+
+        return new Response(null, { status: 405 });
+    };
+
+    return { fetchImpl };
+}
 
 test('open non-sync db', async () => {
     const db = await connect({ path: 'local.db' });
     await db.exec("CREATE TABLE t(x)");
     await db.exec("INSERT INTO t VALUES (1), (2), (3)");
     expect(await (await db.prepare("SELECT * FROM t").all())).toEqual([{ x: 1 }, { x: 2 }, { x: 3 }])
+})
+
+test('s3-page wasm pull bootstraps and advances a pinned read replica', async () => {
+    const originalFetch = globalThis.fetch;
+    const { fetchImpl } = createMockS3Fetch();
+    globalThis.fetch = fetchImpl;
+
+    const endpoint = 'https://mock-s3.invalid';
+    const bucket = `wasm-${Date.now()}`;
+    const prefix = 'db/main';
+    const sync = {
+        backend: 's3_page_v1' as const,
+        endpoint,
+        bucket,
+        prefix,
+        credentials: async () => ({
+            accessKeyId: 'key',
+            secretAccessKey: 'secret',
+        }),
+        remoteEncryption: {
+            key: ENCRYPTION_KEY,
+            cipher: 'aegis256' as const,
+        },
+    };
+
+    const client = new S3PageClient(sync);
+    const writerOnePath = `s3-page-wasm-writer-${Date.now()}-1.db`;
+    const writerTwoPath = `s3-page-wasm-writer-${Date.now()}-2.db`;
+    const replicaPath = `s3-page-wasm-replica-${Date.now()}.db`;
+    let db: Database | null = null;
+
+    try {
+        await client.createBucket();
+
+        let headEtag = await publishRemoteSnapshot({
+            client,
+            endpoint,
+            bucket,
+            prefix,
+            commitId: 'seed-1',
+            parentCommitId: null,
+            sequenceNo: 1,
+            pages: await createSeedSnapshot(writerOnePath, [1, 2, 3]),
+            headEtag: null,
+        });
+
+        db = await connect({
+            path: replicaPath,
+            sync,
+        });
+
+        expect(await db.pull()).toBe(true);
+        expect(await db.prepare('SELECT value as x FROM rows ORDER BY value').all()).toEqual([
+            { x: 1 },
+            { x: 2 },
+            { x: 3 },
+        ]);
+
+        headEtag = await publishRemoteSnapshot({
+            client,
+            endpoint,
+            bucket,
+            prefix,
+            commitId: 'seed-2',
+            parentCommitId: 'seed-1',
+            sequenceNo: 2,
+            pages: await createSeedSnapshot(writerTwoPath, [1, 2, 3, 4]),
+            headEtag,
+        });
+
+        expect(await db.prepare('SELECT value as x FROM rows ORDER BY value').all()).toEqual([
+            { x: 1 },
+            { x: 2 },
+            { x: 3 },
+        ]);
+        expect(await db.pull()).toBe(true);
+        expect(await db.prepare('SELECT value as x FROM rows ORDER BY value').all()).toEqual([
+            { x: 1 },
+            { x: 2 },
+            { x: 3 },
+            { x: 4 },
+        ]);
+        await expect(async () => await db.exec('INSERT INTO rows VALUES (5)')).rejects.toThrow(
+            /read-only in the wasm runtime/,
+        );
+    } finally {
+        if (db != null) {
+            await db.close();
+        }
+        await Promise.all([
+            deleteOpfsFile(replicaPath),
+            deleteOpfsFile(`${replicaPath}-wal`),
+            deleteOpfsFile(`${replicaPath}-s3-page-info`),
+            deleteOpfsFile(writerOnePath),
+            deleteOpfsFile(`${writerOnePath}-wal`),
+            deleteOpfsFile(writerTwoPath),
+            deleteOpfsFile(`${writerTwoPath}-wal`),
+        ]);
+        globalThis.fetch = originalFetch;
+    }
 })
 
 test('checkpoint-and-actions', async () => {
